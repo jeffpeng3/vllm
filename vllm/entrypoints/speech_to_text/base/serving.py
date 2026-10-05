@@ -483,6 +483,23 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             return self._preprocess_verbose_prompt(parse_enc_dec_prompt(prompt))
         return parse_model_prompt(self.model_config, prompt)
 
+    @staticmethod
+    def _is_cjk_char(ch: str) -> bool:
+        """Whether ch is a CJK/hiragana/katakana/hangul letter.
+
+        Local hot-patch: spaceless languages never produce the leading-space
+        boundaries that _group_words splits on, so each such letter becomes
+        its own word and keeps its own DTW timestamp.
+        """
+        o = ord(ch)
+        return (
+            0x3400 <= o <= 0x4DBF  # CJK ext A
+            or 0x4E00 <= o <= 0x9FFF  # CJK unified
+            or 0xF900 <= o <= 0xFAFF  # CJK compat
+            or 0x3040 <= o <= 0x30FF  # hiragana + katakana
+            or 0xAC00 <= o <= 0xD7AF  # hangul syllables
+        )
+
     def _group_words(
         self,
         token_ids: "Sequence[int]",
@@ -509,14 +526,42 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 continue
             piece = str(tok.decode([tid]))
             s, e = float(token_times[pos]), float(token_times[pos + 1])
-            if piece.startswith(" ") and cur:
-                assert cur_start is not None
-                raw.append((cur.strip(), cur_start, prev_end))
-                cur, cur_start = "", None
-            if cur_start is None:
-                cur_start = s
-            cur += piece
-            prev_end = e
+            if not any(self._is_cjk_char(c) for c in piece):
+                if piece.startswith(" ") and cur:
+                    assert cur_start is not None
+                    raw.append((cur.strip(), cur_start, prev_end))
+                    cur, cur_start = "", None
+                if cur_start is None:
+                    cur_start = s
+                cur += piece
+                prev_end = e
+                continue
+            # CJK-bearing token: split each CJK letter into a standalone word
+            # with its share of this token's span, so spaceless languages get
+            # true per-character timestamps instead of one sentence-wide word.
+            # Non-CJK runs keep the original space grouping.
+            chars = list(piece)
+            seg = (e - s) / len(chars)
+            for k, ch in enumerate(chars):
+                cs, ce = s + k * seg, s + (k + 1) * seg
+                if self._is_cjk_char(ch):
+                    if cur:
+                        assert cur_start is not None
+                        raw.append((cur.strip(), cur_start, prev_end))
+                        cur, cur_start = "", None
+                    raw.append((ch, cs, ce))
+                    prev_end = ce
+                else:
+                    if ch == " " and cur:
+                        assert cur_start is not None
+                        raw.append((cur.strip(), cur_start, prev_end))
+                        cur, cur_start = "", None
+                        prev_end = ce
+                        continue
+                    if cur_start is None:
+                        cur_start = cs
+                    cur += ch
+                    prev_end = ce
         if cur:
             assert cur_start is not None
             raw.append((cur.strip(), cur_start, prev_end))
