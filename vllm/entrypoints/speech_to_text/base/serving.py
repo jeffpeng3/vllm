@@ -500,6 +500,33 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             or 0xAC00 <= o <= 0xD7AF  # hangul syllables
         )
 
+    @staticmethod
+    def _bpe_bytes_to_unicode() -> dict[int, str]:
+        """Byte->char map of the GPT-2 style byte-level BPE Whisper uses."""
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(2**8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2**8 + n)
+                n += 1
+        return dict(zip(bs, [chr(c) for c in cs]))
+
+    @staticmethod
+    def _utf8_char_len(lead: int) -> int:
+        if lead < 0x80:
+            return 1
+        if lead < 0xE0:
+            return 2
+        if lead < 0xF0:
+            return 3
+        return 4
+
     def _group_words(
         self,
         token_ids: "Sequence[int]",
@@ -517,6 +544,42 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         cur: str = ""
         cur_start: float | None = None
         prev_end: float = 0.0
+        byte_decoder = {v: k for k, v in self._bpe_bytes_to_unicode().items()}
+        pending: list = []  # [byte, t0, t1] waiting for a complete UTF-8 char
+
+        def feed_char(ch: str, cs: float, ce: float, first: bool) -> None:
+            nonlocal cur, cur_start, prev_end
+            if self._is_cjk_char(ch):
+                if cur:
+                    assert cur_start is not None
+                    raw.append((cur.strip(), cur_start, prev_end))
+                    cur, cur_start = "", None
+                raw.append((ch, cs, ce))
+                prev_end = ce
+            else:
+                if ch == " " and cur and first:
+                    assert cur_start is not None
+                    raw.append((cur.strip(), cur_start, prev_end))
+                    cur, cur_start = "", None
+                    prev_end = ce
+                    return
+                if cur_start is None:
+                    cur_start = cs
+                cur += ch
+                prev_end = ce
+
+        def legacy_piece(piece: str, s: float, e: float) -> None:
+            # Pre-patch behavior for tokens outside the byte map.
+            nonlocal cur, cur_start, prev_end
+            if piece.startswith(" ") and cur:
+                assert cur_start is not None
+                raw.append((cur.strip(), cur_start, prev_end))
+                cur, cur_start = "", None
+            if cur_start is None:
+                cur_start = s
+            cur += piece
+            prev_end = e
+
         for j, tid in enumerate(token_ids):
             pos = n_prompt + j
             if pos + 1 >= len(token_times):
@@ -524,44 +587,44 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             tid = int(tid)
             if tid in specials or tid >= ts_begin:
                 continue
-            piece = str(tok.decode([tid]))
             s, e = float(token_times[pos]), float(token_times[pos + 1])
-            if not any(self._is_cjk_char(c) for c in piece):
-                if piece.startswith(" ") and cur:
-                    assert cur_start is not None
-                    raw.append((cur.strip(), cur_start, prev_end))
-                    cur, cur_start = "", None
-                if cur_start is None:
-                    cur_start = s
-                cur += piece
-                prev_end = e
+            try:
+                tb = bytes(
+                    byte_decoder[c] for c in str(tok.convert_ids_to_tokens(tid))
+                )
+            except KeyError:
+                legacy_piece(str(tok.decode([tid])), s, e)
                 continue
-            # CJK-bearing token: split each CJK letter into a standalone word
-            # with its share of this token's span, so spaceless languages get
-            # true per-character timestamps instead of one sentence-wide word.
-            # Non-CJK runs keep the original space grouping.
-            chars = list(piece)
-            seg = (e - s) / len(chars)
-            for k, ch in enumerate(chars):
-                cs, ce = s + k * seg, s + (k + 1) * seg
-                if self._is_cjk_char(ch):
-                    if cur:
-                        assert cur_start is not None
-                        raw.append((cur.strip(), cur_start, prev_end))
-                        cur, cur_start = "", None
-                    raw.append((ch, cs, ce))
-                    prev_end = ce
-                else:
-                    if ch == " " and cur:
-                        assert cur_start is not None
-                        raw.append((cur.strip(), cur_start, prev_end))
-                        cur, cur_start = "", None
-                        prev_end = ce
-                        continue
-                    if cur_start is None:
-                        cur_start = cs
-                    cur += ch
-                    prev_end = ce
+            if not tb:
+                continue
+            seg = (e - s) / len(tb)
+            first = True
+            for k, byte in enumerate(tb):
+                bs, be = s + k * seg, s + (k + 1) * seg
+                pending.append([byte, bs, be])
+                while pending and len(pending) >= self._utf8_char_len(
+                    pending[0][0]
+                ):
+                    need = self._utf8_char_len(pending[0][0])
+                    chunk = bytes(b for b, _, _ in pending[:need])
+                    try:
+                        ch = chunk.decode("utf-8")
+                        ok = len(ch) == 1
+                    except UnicodeDecodeError:
+                        ok = False
+                    if not ok:
+                        feed_char("�", pending[0][1], pending[0][2], first)
+                        pending.pop(0)
+                    else:
+                        feed_char(ch, pending[0][1], pending[need - 1][2], first)
+                        del pending[:need]
+                    first = False
+        if pending:
+            # Truncated tail char: emit visibly rather than dropping audio.
+            tail = bytes(b for b, _, _ in pending).decode("utf-8", errors="replace")
+            for ch in tail:
+                feed_char(ch, pending[0][1], pending[-1][2], False)
+            pending.clear()
         if cur:
             assert cur_start is not None
             raw.append((cur.strip(), cur_start, prev_end))
